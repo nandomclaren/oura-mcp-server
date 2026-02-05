@@ -276,6 +276,7 @@ async function handleGetPersonalInfo(): Promise<string> {
  * 8. FALLBACK LOGIC: Use nullish coalescing (??) to handle zero values correctly
  * 9. CONTRIBUTOR SCORES: Fixed critical bug where 0-100 scores were treated as seconds
  * 10. IMPOSSIBLE VALUE VALIDATION: Detect and sanitize impossible sleep durations
+ * 11. ENHANCED DEBUGGING: Comprehensive logging for future issue detection
  */
 async function handleGetSleepSummary(args: any): Promise<string> {
   const params = validateParams<{ start_date: string; end_date?: string; include_hrv?: boolean }>(sleepSummarySchema, args);
@@ -292,6 +293,35 @@ async function handleGetSleepSummary(args: any): Promise<string> {
     getDailySleep(start_date, actualEndDate),
     getSleepPeriods(start_date, actualEndDate), // CRITICAL: For accurate duration/efficiency
   ]);
+  
+  // Enhanced debugging for sleep data analysis
+  logger.debug(`=== SLEEP DATA DEBUG SESSION START ===`);
+  logger.debug(`Query: ${start_date} to ${actualEndDate}, include_hrv: ${include_hrv}`);
+  logger.debug(`Daily sleep records: ${data.length}, Detailed sleep records: ${detailedSleepData.length}`);
+  
+  // Log first record for analysis
+  if (data.length > 0) {
+    const sample = data[0];
+    logger.debug(`Sample daily sleep (${sample.day}):`);
+    logger.debug(`  score: ${sample.score}`);
+    logger.debug(`  contributors.total_sleep: ${sample.contributors.total_sleep} (typeof: ${typeof sample.contributors.total_sleep})`);
+    logger.debug(`  contributors.deep_sleep: ${sample.contributors.deep_sleep} (typeof: ${typeof sample.contributors.deep_sleep})`);
+    logger.debug(`  contributors.rem_sleep: ${sample.contributors.rem_sleep} (typeof: ${typeof sample.contributors.rem_sleep})`);
+    logger.debug(`  contributors.efficiency: ${sample.contributors.efficiency}%`);
+    logger.debug(`  contributors.latency: ${sample.contributors.latency}`);
+  }
+  
+  if (detailedSleepData.length > 0) {
+    const sampleDetailed = detailedSleepData[0];
+    logger.debug(`Sample detailed sleep (${sampleDetailed.day}):`);
+    logger.debug(`  total_sleep_duration: ${sampleDetailed.total_sleep_duration}s (${(sampleDetailed.total_sleep_duration/3600).toFixed(1)}h)`);
+    logger.debug(`  deep_sleep_duration: ${sampleDetailed.deep_sleep_duration}s (${(sampleDetailed.deep_sleep_duration/3600).toFixed(1)}h)`);
+    logger.debug(`  rem_sleep_duration: ${sampleDetailed.rem_sleep_duration}s (${(sampleDetailed.rem_sleep_duration/3600).toFixed(1)}h)`);
+    logger.debug(`  light_sleep_duration: ${sampleDetailed.light_sleep_duration}s (${(sampleDetailed.light_sleep_duration/3600).toFixed(1)}h)`);
+    logger.debug(`  time_in_bed: ${sampleDetailed.time_in_bed}s (${(sampleDetailed.time_in_bed/3600).toFixed(1)}h)`);
+    logger.debug(`  awake_time: ${sampleDetailed.awake_time}s (${(sampleDetailed.awake_time/60).toFixed(1)}m)`);
+  }
+  logger.debug(`=== SLEEP DATA DEBUG SESSION END ===`);
   
   // VALIDATION: Check date alignment between endpoints
   const dailySleepDates = new Set(data.map(item => item.day));
@@ -366,33 +396,37 @@ async function handleGetSleepSummary(args: any): Promise<string> {
     
     // Validate total sleep duration
     if (total_sleep_duration > MAX_SLEEP_SECONDS) {
-      logger.warn(`Impossible sleep duration detected for ${item.day}: ${total_sleep_duration}s (${(total_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Impossible sleep duration for ${item.day}: ${total_sleep_duration}s = ${(total_sleep_duration/3600).toFixed(1)} hours`);
+      logger.error(`   This suggests unit confusion - expected range: 14400-43200s (4-12 hours)`);
+      logger.error(`   Source: detailedSleep.total_sleep_duration = ${detailedSleep?.total_sleep_duration}`);
       total_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     if (total_sleep_duration < 0) {
-      logger.warn(`Negative sleep duration detected for ${item.day}: ${total_sleep_duration}s - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative sleep duration for ${item.day}: ${total_sleep_duration}s`);
+      logger.error(`   This indicates data corruption or calculation error`);
       total_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     // Validate time in bed
     if (time_in_bed > MAX_SLEEP_SECONDS * 1.5) { // Allow up to 36 hours for time in bed
-      logger.warn(`Impossible time in bed detected for ${item.day}: ${time_in_bed}s (${(time_in_bed/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Impossible time in bed for ${item.day}: ${time_in_bed}s = ${(time_in_bed/3600).toFixed(1)} hours`);
+      logger.error(`   Expected range: 14400-129600s (4-36 hours)`);
       time_in_bed = 0;
       daysWithValidationIssues++;
     }
     
     if (time_in_bed < 0) {
-      logger.warn(`Negative time in bed detected for ${item.day}: ${time_in_bed}s - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative time in bed for ${item.day}: ${time_in_bed}s`);
       time_in_bed = 0;
       daysWithValidationIssues++;
     }
     
     // Validate awake time
     if (awake_time < 0) {
-      logger.warn(`Negative awake time detected for ${item.day}: ${awake_time}s - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative awake time for ${item.day}: ${awake_time}s`);
       awake_time = 0;
       daysWithValidationIssues++;
     }
@@ -414,20 +448,23 @@ async function handleGetSleepSummary(args: any): Promise<string> {
     
     // VALIDATION: Ensure component sleep durations are reasonable
     if (deep_sleep_duration < 0) {
-      logger.warn(`Negative deep sleep detected for ${item.day}: ${deep_sleep_duration}s - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative deep sleep for ${item.day}: ${deep_sleep_duration}s`);
       deep_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     if (rem_sleep_duration < 0) {
-      logger.warn(`Negative REM sleep detected for ${item.day}: ${rem_sleep_duration}s - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative REM sleep for ${item.day}: ${rem_sleep_duration}s`);
       rem_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     // Ensure light sleep is not negative
     if (light_sleep_duration < 0) {
-      logger.warn(`Negative light sleep detected for ${item.day}: ${light_sleep_duration}s (calculated from total=${total_sleep_duration}, deep=${deep_sleep_duration}, rem=${rem_sleep_duration}) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Negative light sleep for ${item.day}: ${light_sleep_duration}s`);
+      logger.error(`   Calculation: ${total_sleep_duration} - ${deep_sleep_duration} - ${rem_sleep_duration} = ${light_sleep_duration}`);
+      logger.error(`   This indicates data source inconsistency or unit mismatch`);
+      logger.error(`   Contributor scores: total=${item.contributors.total_sleep}, deep=${item.contributors.deep_sleep}, rem=${item.contributors.rem_sleep}`);
       light_sleep_duration = 0;
       daysWithValidationIssues++;
     }
@@ -435,25 +472,31 @@ async function handleGetSleepSummary(args: any): Promise<string> {
     // Validate component sleep durations don't exceed total
     const component_total = deep_sleep_duration + rem_sleep_duration + light_sleep_duration;
     if (component_total > total_sleep_duration && total_sleep_duration > 0) {
-      logger.warn(`Sleep components exceed total for ${item.day}: components=${component_total}s (${(component_total/3600).toFixed(1)}h), total=${total_sleep_duration}s (${(total_sleep_duration/3600).toFixed(1)}h)`);
+      logger.error(`🚨 VALIDATION ALERT: Sleep components exceed total for ${item.day}`);
+      logger.error(`   Components: ${component_total}s (${(component_total/3600).toFixed(1)}h) = deep(${deep_sleep_duration}s) + rem(${rem_sleep_duration}s) + light(${light_sleep_duration}s)`);
+      logger.error(`   Total: ${total_sleep_duration}s (${(total_sleep_duration/3600).toFixed(1)}h)`);
+      logger.error(`   Difference: ${component_total - total_sleep_duration}s (${((component_total - total_sleep_duration)/3600).toFixed(1)}h)`);
       daysWithValidationIssues++;
     }
     
     // Validate component durations are not impossibly large
     if (deep_sleep_duration > MAX_SLEEP_SECONDS) {
-      logger.warn(`Impossible deep sleep duration for ${item.day}: ${deep_sleep_duration}s (${(deep_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Impossible deep sleep duration for ${item.day}: ${deep_sleep_duration}s (${(deep_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`   Expected range: 0-28800s (0-8 hours)`);
       deep_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     if (rem_sleep_duration > MAX_SLEEP_SECONDS) {
-      logger.warn(`Impossible REM sleep duration for ${item.day}: ${rem_sleep_duration}s (${(rem_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Impossible REM sleep duration for ${item.day}: ${rem_sleep_duration}s (${(rem_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`   Expected range: 0-21600s (0-6 hours)`);
       rem_sleep_duration = 0;
       daysWithValidationIssues++;
     }
     
     if (light_sleep_duration > MAX_SLEEP_SECONDS) {
-      logger.warn(`Impossible light sleep duration for ${item.day}: ${light_sleep_duration}s (${(light_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`🚨 VALIDATION ALERT: Impossible light sleep duration for ${item.day}: ${light_sleep_duration}s (${(light_sleep_duration/3600).toFixed(1)}h) - resetting to 0`);
+      logger.error(`   Expected range: 0-43200s (0-12 hours)`);
       light_sleep_duration = 0;
       daysWithValidationIssues++;
     }
