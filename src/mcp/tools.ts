@@ -274,6 +274,7 @@ async function handleGetPersonalInfo(): Promise<string> {
  * 6. CACHE KEY BUG: Fixed to use actual end_date instead of literal 'today'
  * 7. DATE MATCHING VALIDATION: Validate dates align between endpoints
  * 8. FALLBACK LOGIC: Use nullish coalescing (??) to handle zero values correctly
+ * 9. CONTRIBUTOR SCORES: Fixed critical bug where 0-100 scores were treated as seconds
  */
 async function handleGetSleepSummary(args: any): Promise<string> {
   const params = validateParams<{ start_date: string; end_date?: string; include_hrv?: boolean }>(sleepSummarySchema, args);
@@ -327,55 +328,66 @@ async function handleGetSleepSummary(args: any): Promise<string> {
     
     // VALIDATION: Log if detailed sleep is missing for this specific day
     if (!detailedSleep) {
-      logger.debug(`Using fallback sleep calculations for ${item.day} (no detailed sleep data)`);
+      logger.warn(`CRITICAL: No detailed sleep data for ${item.day} - cannot calculate accurate durations. Daily sleep contributors are scores (0-100), not durations.`);
       daysWithFallbackData++;
     } else {
       daysWithDetailedData++;
     }
     
-    // FIXED: Calculate actual sleep metrics from detailed data when available
-    let total_sleep_duration = item.contributors.total_sleep; // Fallback
-    let calculated_efficiency = item.contributors.efficiency; // Fallback
-    let awake_time = item.contributors.total_sleep * (1 - item.contributors.efficiency / 100); // Fallback
-    let time_in_bed = total_sleep_duration + awake_time; // Fallback
+    // CRITICAL FIX: DO NOT use contributor scores as duration fallbacks
+    // item.contributors.total_sleep, deep_sleep, rem_sleep are SCORES (0-100), NOT seconds
+    // Only use values from detailedSleep which contains actual duration measurements
+    let total_sleep_duration = 0;
+    let calculated_efficiency = 0;
+    let awake_time = 0;
+    let time_in_bed = 0;
     
     if (detailedSleep) {
-      // FIXED: Use nullish coalescing to handle zero values correctly
-      total_sleep_duration = detailedSleep.total_sleep_duration ?? total_sleep_duration;
-      time_in_bed = detailedSleep.time_in_bed ?? time_in_bed;
-      awake_time = detailedSleep.awake_time ?? awake_time;
+      // Use actual measured values from detailed sleep endpoint (in seconds)
+      total_sleep_duration = detailedSleep.total_sleep_duration ?? 0;
+      time_in_bed = detailedSleep.time_in_bed ?? 0;
+      awake_time = detailedSleep.awake_time ?? 0;
       
-      // FIXED: Calculate REAL efficiency from actual time in bed vs sleep duration
+      // Calculate real efficiency from actual measurements
       if (time_in_bed > 0) {
         calculated_efficiency = (total_sleep_duration / time_in_bed) * 100;
       }
+    } else {
+      // NO FALLBACK - we cannot calculate durations without detailed sleep data
+      // Contributor scores are 0-100 scores, not duration values in seconds
+      logger.debug(`Cannot provide duration metrics for ${item.day} - detailed sleep data required`);
     }
     
-    // FIXED: Use detailed sleep for component durations too
-    const deep_sleep_duration = detailedSleep?.deep_sleep_duration ?? item.contributors.deep_sleep;
-    const rem_sleep_duration = detailedSleep?.rem_sleep_duration ?? item.contributors.rem_sleep;
+    // CRITICAL FIX: Component durations - DO NOT use contributor scores as fallbacks
+    // Contributor scores are 0-100, not seconds!
+    const deep_sleep_duration = detailedSleep?.deep_sleep_duration ?? 0;
+    const rem_sleep_duration = detailedSleep?.rem_sleep_duration ?? 0;
     const light_sleep_duration = detailedSleep?.light_sleep_duration ?? 
       (total_sleep_duration - deep_sleep_duration - rem_sleep_duration);
-    const latency = detailedSleep?.latency ?? item.contributors.latency;
+    const latency = detailedSleep?.latency ?? 0;
 
     // Base data with FIXED calculations
     const baseData = {
       date: item.day,
       score: item.score,
-      // CRITICAL FIXES for duration and efficiency
+      // Duration metrics (all in seconds) - only from detailed sleep
       total_sleep_duration: total_sleep_duration,
       time_in_bed: time_in_bed,
       efficiency: calculated_efficiency,
-      efficiency_score: item.contributors.efficiency,
+      efficiency_score: item.contributors.efficiency, // Keep the score for reference
       awake_time: awake_time,
-      // Component durations
+      // Component durations (all in seconds)
       latency: latency,
       deep_sleep_duration: deep_sleep_duration,
       rem_sleep_duration: rem_sleep_duration,
       light_sleep_duration: light_sleep_duration,
-      // Other contributors
+      // Contributor scores (these are 0-100 scores, not durations)
       restfulness: item.contributors.restfulness,
       timing: item.contributors.timing,
+      total_sleep_score: item.contributors.total_sleep, // Renamed to clarify it's a score
+      deep_sleep_score: item.contributors.deep_sleep, // Renamed to clarify it's a score
+      rem_sleep_score: item.contributors.rem_sleep, // Renamed to clarify it's a score
+      latency_score: item.contributors.latency, // Renamed to clarify it's a score
       // DATA QUALITY: Indicate if detailed data was used
       has_detailed_sleep: detailedSleep !== undefined,
     };
