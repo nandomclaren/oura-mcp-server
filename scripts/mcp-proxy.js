@@ -7,8 +7,8 @@
  * to the remote Oura MCP server on Railway.
  */
 
-const https = require('https');
-const readline = require('readline');
+import https from 'https';
+import readline from 'readline';
 
 const CONFIG = {
   serverUrl: 'web-production-8ca97.up.railway.app',

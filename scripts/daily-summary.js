@@ -7,7 +7,7 @@
  * Este script pode ser executado diariamente via cron job
  */
 
-const https = require('https');
+import https from 'https';
 
 const CONFIG = {
   serverUrl: 'web-production-8ca97.up.railway.app',
