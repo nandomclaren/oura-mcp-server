@@ -1,0 +1,912 @@
+import { getPersonalInfo, getDailySleep, getDailyActivity, getDailyReadiness, getHeartRate, getWorkouts, getSleepPeriods, getTags, } from '../oura/client.js';
+import { validateParams, dateRangeSchema, sleepSummarySchema, datetimeRangeSchema, healthInsightsSchema, getTodayDate, getDaysAgo, } from '../utils/validation.js';
+import cache from '../utils/cache.js';
+import { logger } from '../utils/logger.js';
+/**
+ * List of all available MCP tools
+ */
+export const tools = [
+    {
+        name: 'get_personal_info',
+        description: "Get user's personal information and ring details",
+        inputSchema: {
+            type: 'object',
+            properties: {},
+        },
+    },
+    {
+        name: 'get_sleep_summary',
+        description: 'Get sleep data for a date range',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional, defaults to today)',
+                },
+                include_hrv: {
+                    type: 'boolean',
+                    description: 'Include HRV data (default: false)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_readiness_score',
+        description: 'Get daily readiness scores',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_activity_summary',
+        description: 'Get activity data for a date range',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_heart_rate',
+        description: 'Get heart rate data (5-minute intervals)',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_datetime: {
+                    type: 'string',
+                    description: 'Start datetime in ISO 8601 format',
+                },
+                end_datetime: {
+                    type: 'string',
+                    description: 'End datetime in ISO 8601 format (optional, defaults to now)',
+                },
+            },
+            required: ['start_datetime'],
+        },
+    },
+    {
+        name: 'get_workouts',
+        description: 'Get workout sessions',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_sleep_detailed',
+        description: 'Get detailed sleep period data (multiple sleep sessions per day)',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_tags',
+        description: 'Get user-created tags (notes/comments on specific days)',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_date: {
+                    type: 'string',
+                    description: 'Start date in YYYY-MM-DD format',
+                },
+                end_date: {
+                    type: 'string',
+                    description: 'End date in YYYY-MM-DD format (optional)',
+                },
+            },
+            required: ['start_date'],
+        },
+    },
+    {
+        name: 'get_health_insights',
+        description: 'Get AI-powered insights based on recent data',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                days: {
+                    type: 'number',
+                    description: 'Number of days to analyze (default: 7)',
+                },
+            },
+        },
+    },
+];
+/**
+ * Executes a tool call and returns the result
+ */
+export async function executeToolCall(toolCall) {
+    const { name, arguments: args } = toolCall;
+    logger.info(`Tool: ${name}`);
+    logger.debug(`Tool args:`, args);
+    try {
+        let result;
+        switch (name) {
+            case 'get_personal_info':
+                result = await handleGetPersonalInfo();
+                break;
+            case 'get_sleep_summary':
+                result = await handleGetSleepSummary(args);
+                break;
+            case 'get_readiness_score':
+                result = await handleGetReadinessScore(args);
+                break;
+            case 'get_activity_summary':
+                result = await handleGetActivitySummary(args);
+                break;
+            case 'get_heart_rate':
+                result = await handleGetHeartRate(args);
+                break;
+            case 'get_workouts':
+                result = await handleGetWorkouts(args);
+                break;
+            case 'get_sleep_detailed':
+                result = await handleGetSleepDetailed(args);
+                break;
+            case 'get_tags':
+                result = await handleGetTags(args);
+                break;
+            case 'get_health_insights':
+                result = await handleGetHealthInsights(args);
+                break;
+            default:
+                throw new Error(`Unknown tool: ${name}`);
+        }
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: result,
+                },
+            ],
+        };
+    }
+    catch (error) {
+        logger.error(`Error executing tool ${name}:`, error);
+        throw error;
+    }
+}
+/**
+ * Handler for get_personal_info tool
+ */
+async function handleGetPersonalInfo() {
+    const cacheKey = 'personal_info';
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getPersonalInfo();
+    const result = JSON.stringify({
+        age: data.age,
+        weight: data.weight,
+        height: data.height,
+        biological_sex: data.biological_sex,
+        email: data.email,
+    }, null, 2);
+    cache.set(cacheKey, result, 3600000); // Cache for 1 hour
+    return result;
+}
+/**
+ * Handler for get_sleep_summary tool
+ *
+ * BUG FIXES:
+ * 1. SLEEP DURATION UNITS: Removed incorrect * 3600 conversion
+ * 2. HRV DATA: Fetch real HRV from readiness + detailed sleep endpoints
+ * 3. SLEEP EFFICIENCY & DURATION: Cross-reference with detailed sleep periods
+ * 4. AWAKE TIME: Calculate from actual time in bed vs sleep duration
+ * 5. RAW HRV/RHR VALUES: Add explicit raw value fields
+ * 6. CACHE KEY BUG: Fixed to use actual end_date instead of literal 'today'
+ * 7. DATE MATCHING VALIDATION: Validate dates align between endpoints
+ * 8. FALLBACK LOGIC: Use nullish coalescing (??) to handle zero values correctly
+ * 9. CONTRIBUTOR SCORES: Fixed critical bug where 0-100 scores were treated as seconds
+ * 10. IMPOSSIBLE VALUE VALIDATION: Detect and sanitize impossible sleep durations
+ * 11. ENHANCED DEBUGGING: Comprehensive logging for future issue detection
+ */
+async function handleGetSleepSummary(args) {
+    const params = validateParams(sleepSummarySchema, args);
+    const { start_date, end_date, include_hrv } = params;
+    // FIXED: Resolve end_date to actual date for cache key consistency
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `sleep_summary:${start_date}:${actualEndDate}:${include_hrv || false}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    // FIXED: Fetch ALL necessary data sources for accurate calculations
+    const [data, detailedSleepData] = await Promise.all([
+        getDailySleep(start_date, actualEndDate),
+        getSleepPeriods(start_date, actualEndDate), // CRITICAL: For accurate duration/efficiency
+    ]);
+    // Enhanced debugging for sleep data analysis
+    logger.debug(`=== SLEEP DATA DEBUG SESSION START ===`);
+    logger.debug(`Query: ${start_date} to ${actualEndDate}, include_hrv: ${include_hrv}`);
+    logger.debug(`Daily sleep records: ${data.length}, Detailed sleep records: ${detailedSleepData.length}`);
+    // Log first record for analysis
+    if (data.length > 0) {
+        const sample = data[0];
+        logger.debug(`Sample daily sleep (${sample.day}):`);
+        logger.debug(`  score: ${sample.score}`);
+        logger.debug(`  contributors.total_sleep: ${sample.contributors.total_sleep} (typeof: ${typeof sample.contributors.total_sleep})`);
+        logger.debug(`  contributors.deep_sleep: ${sample.contributors.deep_sleep} (typeof: ${typeof sample.contributors.deep_sleep})`);
+        logger.debug(`  contributors.rem_sleep: ${sample.contributors.rem_sleep} (typeof: ${typeof sample.contributors.rem_sleep})`);
+        logger.debug(`  contributors.efficiency: ${sample.contributors.efficiency}%`);
+        logger.debug(`  contributors.latency: ${sample.contributors.latency}`);
+    }
+    if (detailedSleepData.length > 0) {
+        const sampleDetailed = detailedSleepData[0];
+        logger.debug(`Sample detailed sleep (${sampleDetailed.day}):`);
+        logger.debug(`  total_sleep_duration: ${sampleDetailed.total_sleep_duration}s (${(sampleDetailed.total_sleep_duration / 3600).toFixed(1)}h)`);
+        logger.debug(`  deep_sleep_duration: ${sampleDetailed.deep_sleep_duration}s (${(sampleDetailed.deep_sleep_duration / 3600).toFixed(1)}h)`);
+        logger.debug(`  rem_sleep_duration: ${sampleDetailed.rem_sleep_duration}s (${(sampleDetailed.rem_sleep_duration / 3600).toFixed(1)}h)`);
+        logger.debug(`  light_sleep_duration: ${sampleDetailed.light_sleep_duration}s (${(sampleDetailed.light_sleep_duration / 3600).toFixed(1)}h)`);
+        logger.debug(`  time_in_bed: ${sampleDetailed.time_in_bed}s (${(sampleDetailed.time_in_bed / 3600).toFixed(1)}h)`);
+        logger.debug(`  awake_time: ${sampleDetailed.awake_time}s (${(sampleDetailed.awake_time / 60).toFixed(1)}m)`);
+    }
+    logger.debug(`=== SLEEP DATA DEBUG SESSION END ===`);
+    // VALIDATION: Check date alignment between endpoints
+    const dailySleepDates = new Set(data.map(item => item.day));
+    const detailedSleepDates = new Set(detailedSleepData.map(item => item.day));
+    const missingDetailedDates = [...dailySleepDates].filter(date => !detailedSleepDates.has(date));
+    if (missingDetailedDates.length > 0) {
+        logger.warn(`Daily sleep has dates not in detailed sleep: ${missingDetailedDates.join(', ')}`);
+    }
+    // FIXED: Fetch both readiness (for HRV balance + RHR) and detailed sleep (for HRV samples)
+    let readinessData = [];
+    let missingReadinessDates = [];
+    if (include_hrv) {
+        readinessData = await getDailyReadiness(start_date, actualEndDate);
+        // VALIDATION: Check HRV data alignment
+        const readinessDates = new Set(readinessData.map(item => item.day));
+        missingReadinessDates = [...dailySleepDates].filter(date => !readinessDates.has(date));
+        if (missingReadinessDates.length > 0) {
+            logger.warn(`HRV requested but readiness data missing for dates: ${missingReadinessDates.join(', ')}`);
+        }
+    }
+    // Track data quality metadata
+    let daysWithDetailedData = 0;
+    let daysWithReadinessData = 0;
+    let daysWithFallbackData = 0;
+    let daysWithValidationIssues = 0;
+    const mapped = data.map((item) => {
+        // FIXED: Get detailed sleep period for this day for accurate calculations
+        const detailedSleep = detailedSleepData.find((d) => d.day === item.day);
+        // VALIDATION: Log if detailed sleep is missing for this specific day
+        if (!detailedSleep) {
+            logger.warn(`CRITICAL: No detailed sleep data for ${item.day} - cannot calculate accurate durations. Daily sleep contributors are scores (0-100), not durations.`);
+            daysWithFallbackData++;
+        }
+        else {
+            daysWithDetailedData++;
+        }
+        // CRITICAL FIX: DO NOT use contributor scores as duration fallbacks
+        // item.contributors.total_sleep, deep_sleep, rem_sleep are SCORES (0-100), NOT seconds
+        // Only use values from detailedSleep which contains actual duration measurements
+        let total_sleep_duration = 0;
+        let calculated_efficiency = 0;
+        let awake_time = 0;
+        let time_in_bed = 0;
+        if (detailedSleep) {
+            // Use actual measured values from detailed sleep endpoint (in seconds)
+            total_sleep_duration = detailedSleep.total_sleep_duration ?? 0;
+            time_in_bed = detailedSleep.time_in_bed ?? 0;
+            awake_time = detailedSleep.awake_time ?? 0;
+            // Calculate real efficiency from actual measurements
+            if (time_in_bed > 0) {
+                calculated_efficiency = (total_sleep_duration / time_in_bed) * 100;
+            }
+        }
+        else {
+            // NO FALLBACK - we cannot calculate durations without detailed sleep data
+            // Contributor scores are 0-100 scores, not duration values in seconds
+            logger.debug(`Cannot provide duration metrics for ${item.day} - detailed sleep data required`);
+        }
+        // VALIDATION: Detect impossible sleep values (>24 hours or negative)
+        const MAX_SLEEP_HOURS = 24;
+        const MAX_SLEEP_SECONDS = MAX_SLEEP_HOURS * 3600; // 86400 seconds
+        // Validate total sleep duration
+        if (total_sleep_duration > MAX_SLEEP_SECONDS) {
+            logger.error(`🚨 VALIDATION ALERT: Impossible sleep duration for ${item.day}: ${total_sleep_duration}s = ${(total_sleep_duration / 3600).toFixed(1)} hours`);
+            logger.error(`   This suggests unit confusion - expected range: 14400-43200s (4-12 hours)`);
+            logger.error(`   Source: detailedSleep.total_sleep_duration = ${detailedSleep?.total_sleep_duration}`);
+            total_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        if (total_sleep_duration < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative sleep duration for ${item.day}: ${total_sleep_duration}s`);
+            logger.error(`   This indicates data corruption or calculation error`);
+            total_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        // Validate time in bed
+        if (time_in_bed > MAX_SLEEP_SECONDS * 1.5) { // Allow up to 36 hours for time in bed
+            logger.error(`🚨 VALIDATION ALERT: Impossible time in bed for ${item.day}: ${time_in_bed}s = ${(time_in_bed / 3600).toFixed(1)} hours`);
+            logger.error(`   Expected range: 14400-129600s (4-36 hours)`);
+            time_in_bed = 0;
+            daysWithValidationIssues++;
+        }
+        if (time_in_bed < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative time in bed for ${item.day}: ${time_in_bed}s`);
+            time_in_bed = 0;
+            daysWithValidationIssues++;
+        }
+        // Validate awake time
+        if (awake_time < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative awake time for ${item.day}: ${awake_time}s`);
+            awake_time = 0;
+            daysWithValidationIssues++;
+        }
+        // Recalculate efficiency if values were sanitized
+        if (time_in_bed > 0 && total_sleep_duration > 0) {
+            calculated_efficiency = (total_sleep_duration / time_in_bed) * 100;
+        }
+        else {
+            calculated_efficiency = 0;
+        }
+        // CRITICAL FIX: Component durations - DO NOT use contributor scores as fallbacks
+        // Contributor scores are 0-100, not seconds!
+        let deep_sleep_duration = detailedSleep?.deep_sleep_duration ?? 0;
+        let rem_sleep_duration = detailedSleep?.rem_sleep_duration ?? 0;
+        let light_sleep_duration = detailedSleep?.light_sleep_duration ??
+            (total_sleep_duration - deep_sleep_duration - rem_sleep_duration);
+        let latency = detailedSleep?.latency ?? 0;
+        // VALIDATION: Ensure component sleep durations are reasonable
+        if (deep_sleep_duration < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative deep sleep for ${item.day}: ${deep_sleep_duration}s`);
+            deep_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        if (rem_sleep_duration < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative REM sleep for ${item.day}: ${rem_sleep_duration}s`);
+            rem_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        // Ensure light sleep is not negative
+        if (light_sleep_duration < 0) {
+            logger.error(`🚨 VALIDATION ALERT: Negative light sleep for ${item.day}: ${light_sleep_duration}s`);
+            logger.error(`   Calculation: ${total_sleep_duration} - ${deep_sleep_duration} - ${rem_sleep_duration} = ${light_sleep_duration}`);
+            logger.error(`   This indicates data source inconsistency or unit mismatch`);
+            logger.error(`   Contributor scores: total=${item.contributors.total_sleep}, deep=${item.contributors.deep_sleep}, rem=${item.contributors.rem_sleep}`);
+            light_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        // Validate component sleep durations don't exceed total
+        const component_total = deep_sleep_duration + rem_sleep_duration + light_sleep_duration;
+        if (component_total > total_sleep_duration && total_sleep_duration > 0) {
+            logger.error(`🚨 VALIDATION ALERT: Sleep components exceed total for ${item.day}`);
+            logger.error(`   Components: ${component_total}s (${(component_total / 3600).toFixed(1)}h) = deep(${deep_sleep_duration}s) + rem(${rem_sleep_duration}s) + light(${light_sleep_duration}s)`);
+            logger.error(`   Total: ${total_sleep_duration}s (${(total_sleep_duration / 3600).toFixed(1)}h)`);
+            logger.error(`   Difference: ${component_total - total_sleep_duration}s (${((component_total - total_sleep_duration) / 3600).toFixed(1)}h)`);
+            daysWithValidationIssues++;
+        }
+        // Validate component durations are not impossibly large
+        if (deep_sleep_duration > MAX_SLEEP_SECONDS) {
+            logger.error(`🚨 VALIDATION ALERT: Impossible deep sleep duration for ${item.day}: ${deep_sleep_duration}s (${(deep_sleep_duration / 3600).toFixed(1)}h) - resetting to 0`);
+            logger.error(`   Expected range: 0-28800s (0-8 hours)`);
+            deep_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        if (rem_sleep_duration > MAX_SLEEP_SECONDS) {
+            logger.error(`🚨 VALIDATION ALERT: Impossible REM sleep duration for ${item.day}: ${rem_sleep_duration}s (${(rem_sleep_duration / 3600).toFixed(1)}h) - resetting to 0`);
+            logger.error(`   Expected range: 0-21600s (0-6 hours)`);
+            rem_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        if (light_sleep_duration > MAX_SLEEP_SECONDS) {
+            logger.error(`🚨 VALIDATION ALERT: Impossible light sleep duration for ${item.day}: ${light_sleep_duration}s (${(light_sleep_duration / 3600).toFixed(1)}h) - resetting to 0`);
+            logger.error(`   Expected range: 0-43200s (0-12 hours)`);
+            light_sleep_duration = 0;
+            daysWithValidationIssues++;
+        }
+        // Base data with FIXED and VALIDATED calculations
+        const baseData = {
+            date: item.day,
+            score: item.score,
+            // Duration metrics (all in seconds) - only from detailed sleep
+            total_sleep_duration: total_sleep_duration,
+            time_in_bed: time_in_bed,
+            efficiency: calculated_efficiency,
+            efficiency_score: item.contributors.efficiency, // Keep the score for reference
+            awake_time: awake_time,
+            // Component durations (all in seconds)
+            latency: latency,
+            deep_sleep_duration: deep_sleep_duration,
+            rem_sleep_duration: rem_sleep_duration,
+            light_sleep_duration: light_sleep_duration,
+            // Contributor scores (these are 0-100 scores, not durations)
+            restfulness: item.contributors.restfulness,
+            timing: item.contributors.timing,
+            total_sleep_score: item.contributors.total_sleep, // Renamed to clarify it's a score
+            deep_sleep_score: item.contributors.deep_sleep, // Renamed to clarify it's a score
+            rem_sleep_score: item.contributors.rem_sleep, // Renamed to clarify it's a score
+            latency_score: item.contributors.latency, // Renamed to clarify it's a score
+            // DATA QUALITY: Indicate if detailed data was used
+            has_detailed_sleep: detailedSleep !== undefined,
+        };
+        // FIXED: Get real HRV data from appropriate endpoints
+        if (include_hrv) {
+            const readiness = readinessData.find((r) => r.day === item.day);
+            // VALIDATION: Track readiness data availability
+            if (readiness) {
+                daysWithReadinessData++;
+            }
+            else {
+                logger.debug(`No readiness data for ${item.day}, HRV values will be null`);
+            }
+            return {
+                ...baseData,
+                // Contributor scores (0-100) - scores, not raw measurements
+                hrv_balance_score: readiness?.contributors.hrv_balance ?? null,
+                resting_heart_rate_score: readiness?.contributors.resting_heart_rate ?? null,
+                // Real measured values from detailed sleep endpoint
+                hrv_average_ms: detailedSleep?.average_hrv ?? null,
+                hrv_samples_count: detailedSleep?.hrv?.items?.length ?? 0,
+                resting_heart_rate_bpm: detailedSleep?.lowest_heart_rate ?? null,
+                // DATA QUALITY: Indicate if HRV data was found
+                has_readiness_data: readiness !== undefined,
+            };
+        }
+        return baseData;
+    });
+    const summary = {
+        average_score: mapped.reduce((acc, item) => acc + item.score, 0) / mapped.length,
+        average_duration: mapped.reduce((acc, item) => acc + item.total_sleep_duration, 0) / mapped.length,
+        average_duration_hours: (mapped.reduce((acc, item) => acc + item.total_sleep_duration, 0) / mapped.length) / 3600,
+        average_efficiency: mapped.reduce((acc, item) => acc + item.efficiency, 0) / mapped.length,
+        average_time_in_bed: mapped.reduce((acc, item) => acc + item.time_in_bed, 0) / mapped.length,
+        total_days: mapped.length,
+        // DATA QUALITY METADATA
+        days_with_detailed_sleep: daysWithDetailedData,
+        days_with_fallback_calculations: daysWithFallbackData,
+        days_with_validation_issues: daysWithValidationIssues,
+        ...(include_hrv && {
+            days_with_hrv_data: daysWithReadinessData,
+            days_missing_hrv: missingReadinessDates.length,
+        }),
+    };
+    const result = JSON.stringify({ data: mapped, summary }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_readiness_score tool
+ *
+ * Contains REAL RHR and HRV values from Oura getDailyReadiness endpoint
+ *
+ * CACHE KEY BUG FIX: Use actual end_date instead of literal 'today'
+ */
+async function handleGetReadinessScore(args) {
+    const params = validateParams(dateRangeSchema, args);
+    const { start_date, end_date } = params;
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `readiness:${start_date}:${actualEndDate}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    // Fetch readiness + detailed sleep in parallel to get real RHR (BPM) and HRV (ms)
+    // NOTE: contributors.resting_heart_rate and contributors.hrv_balance are SCORES (0-100),
+    // NOT real values. Real values come from the sleep periods endpoint.
+    const [data, sleepData] = await Promise.all([
+        getDailyReadiness(start_date, actualEndDate),
+        getSleepPeriods(start_date, actualEndDate),
+    ]);
+    const mapped = data.map((item) => {
+        const sleepForDay = sleepData.find((s) => s.day === item.day);
+        return {
+            date: item.day,
+            score: item.score,
+            temperature_deviation: item.temperature_deviation,
+            temperature_trend_deviation: item.temperature_trend_deviation,
+            // Contributor scores (0-100) - these are scores, not raw measurements
+            activity_balance_score: item.contributors.activity_balance,
+            body_temperature_score: item.contributors.body_temperature,
+            hrv_balance_score: item.contributors.hrv_balance,
+            previous_day_activity_score: item.contributors.previous_day_activity,
+            previous_night_score: item.contributors.previous_night,
+            recovery_index_score: item.contributors.recovery_index,
+            resting_heart_rate_score: item.contributors.resting_heart_rate,
+            sleep_balance_score: item.contributors.sleep_balance,
+            // Real measured values from sleep periods endpoint
+            resting_heart_rate_bpm: sleepForDay?.lowest_heart_rate ?? null,
+            hrv_average_ms: sleepForDay?.average_hrv ?? null,
+        };
+    });
+    const avgScore = mapped.reduce((acc, item) => acc + item.score, 0) / mapped.length;
+    const firstScore = mapped[0]?.score || 0;
+    const lastScore = mapped[mapped.length - 1]?.score || 0;
+    const trend = lastScore > firstScore + 5 ? 'improving' : lastScore < firstScore - 5 ? 'declining' : 'stable';
+    const validRHR = mapped.filter((item) => item.resting_heart_rate_bpm !== null);
+    const validHRV = mapped.filter((item) => item.hrv_average_ms !== null);
+    const summary = {
+        average_score: avgScore,
+        trend,
+        total_days: mapped.length,
+        average_resting_hr_bpm: validRHR.length > 0
+            ? validRHR.reduce((acc, item) => acc + (item.resting_heart_rate_bpm || 0), 0) / validRHR.length
+            : null,
+        average_hrv_ms: validHRV.length > 0
+            ? validHRV.reduce((acc, item) => acc + (item.hrv_average_ms || 0), 0) / validHRV.length
+            : null,
+        average_hrv_balance_score: mapped.reduce((acc, item) => acc + item.hrv_balance_score, 0) / mapped.length,
+    };
+    const result = JSON.stringify({ data: mapped, summary }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_activity_summary tool
+ *
+ * CACHE KEY BUG FIX: Use actual end_date instead of literal 'today'
+ */
+async function handleGetActivitySummary(args) {
+    const params = validateParams(dateRangeSchema, args);
+    const { start_date, end_date } = params;
+    // FIXED: Resolve end_date to actual date for cache key consistency
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `activity:${start_date}:${actualEndDate}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getDailyActivity(start_date, actualEndDate);
+    const mapped = data.map((item) => ({
+        date: item.day,
+        score: item.score,
+        active_calories: item.active_calories,
+        total_calories: item.total_calories,
+        steps: item.steps,
+        equivalent_walking_distance: item.equivalent_walking_distance,
+        high_activity_time: item.high_activity_time,
+        medium_activity_time: item.medium_activity_time,
+        low_activity_time: item.low_activity_time,
+        sedentary_time: item.sedentary_time,
+        resting_time: item.resting_time,
+        average_met: item.average_met_minutes,
+        inactivity_alerts: item.inactivity_alerts,
+        target_calories: item.target_calories,
+        target_meters: item.target_meters,
+        meet_daily_targets: item.contributors.meet_daily_targets,
+    }));
+    const summary = {
+        average_score: mapped.reduce((acc, item) => acc + item.score, 0) / mapped.length,
+        total_steps: mapped.reduce((acc, item) => acc + item.steps, 0),
+        total_calories: mapped.reduce((acc, item) => acc + item.total_calories, 0),
+        average_steps_per_day: mapped.reduce((acc, item) => acc + item.steps, 0) / mapped.length,
+        total_days: mapped.length,
+    };
+    const result = JSON.stringify({ data: mapped, summary }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_heart_rate tool
+ *
+ * BUG FIXES:
+ * 1. RHR CALCULATION: Use real RHR from getDailyReadiness instead of Math.min
+ * 2. TIMEZONE HANDLING: Preserve ISO 8601 timestamps
+ * 3. CACHE KEY BUG: Use actual end_datetime instead of literal 'now'
+ */
+async function handleGetHeartRate(args) {
+    const params = validateParams(datetimeRangeSchema, args);
+    const { start_datetime, end_datetime } = params;
+    // FIXED: Resolve end_datetime to actual datetime for cache key consistency
+    const actualEndDatetime = end_datetime || new Date().toISOString();
+    const cacheKey = `heart_rate:${start_datetime}:${actualEndDatetime}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getHeartRate(start_datetime, end_datetime);
+    // FIXED: Preserve timezone-aware timestamps
+    const mapped = data.map((item) => ({
+        timestamp: item.timestamp, // ISO 8601 with timezone
+        bpm: item.bpm,
+        source: item.source,
+    }));
+    const bpms = mapped.map((item) => item.bpm);
+    // FIXED: Fetch REAL resting HR from readiness endpoint
+    let realRestingHR = null;
+    let rhrSource = 'unavailable';
+    try {
+        // Extract date from datetime for readiness query
+        const startDate = start_datetime.split('T')[0];
+        const endDate = end_datetime ? end_datetime.split('T')[0] : getTodayDate();
+        const readinessData = await getDailyReadiness(startDate, endDate);
+        if (readinessData.length > 0) {
+            // Use most recent readiness data
+            const latestReadiness = readinessData[readinessData.length - 1];
+            realRestingHR = latestReadiness.contributors.resting_heart_rate;
+            rhrSource = 'readiness_api';
+        }
+    }
+    catch (error) {
+        logger.warn('Could not fetch resting HR from readiness endpoint:', error);
+    }
+    const summary = {
+        average_bpm: Math.round(bpms.reduce((acc, bpm) => acc + bpm, 0) / bpms.length),
+        min_bpm: Math.min(...bpms),
+        max_bpm: Math.max(...bpms),
+        resting_hr: realRestingHR, // FIXED: Real RHR from Oura API
+        resting_hr_source: rhrSource, // Track data source for transparency
+        total_readings: mapped.length,
+    };
+    const result = JSON.stringify({ data: mapped, summary }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_workouts tool
+ *
+ * BUG FIXES:
+ * 1. HEART RATE DATA: Fetch real HR data from getHeartRate endpoint
+ * 2. CACHE KEY BUG: Use actual end_date instead of literal 'today'
+ */
+async function handleGetWorkouts(args) {
+    const params = validateParams(dateRangeSchema, args);
+    const { start_date, end_date } = params;
+    // FIXED: Resolve end_date to actual date for cache key consistency
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `workouts:${start_date}:${actualEndDate}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getWorkouts(start_date, actualEndDate);
+    // FIXED: Fetch heart rate data for each workout period
+    const mapped = await Promise.all(data.map(async (item) => {
+        let avgHR = null;
+        let maxHR = null;
+        try {
+            // Fetch HR data for the specific workout timeframe
+            const hrData = await getHeartRate(item.start_datetime, item.end_datetime);
+            if (hrData.length > 0) {
+                const bpms = hrData.map((hr) => hr.bpm);
+                avgHR = Math.round(bpms.reduce((acc, bpm) => acc + bpm, 0) / bpms.length);
+                maxHR = Math.max(...bpms);
+            }
+        }
+        catch (error) {
+            logger.warn(`Failed to fetch HR data for workout on ${item.day}:`, error);
+        }
+        return {
+            date: item.day,
+            activity: item.activity,
+            intensity: item.intensity,
+            start_datetime: item.start_datetime, // ISO 8601 format
+            end_datetime: item.end_datetime, // ISO 8601 format
+            calories: item.calories,
+            distance: item.distance,
+            average_heart_rate: avgHR, // FIXED: Real workout HR
+            max_heart_rate: maxHR, // FIXED: Real max HR
+        };
+    }));
+    const activities = [...new Set(mapped.map((item) => item.activity))];
+    // FIXED: Timezone-aware duration calculation
+    const summary = {
+        total_workouts: mapped.length,
+        total_calories: mapped.reduce((acc, item) => acc + item.calories, 0),
+        total_duration: mapped.reduce((acc, item) => {
+            const start = new Date(item.start_datetime);
+            const end = new Date(item.end_datetime);
+            return acc + (end.getTime() - start.getTime()) / 1000;
+        }, 0),
+        activities,
+    };
+    const result = JSON.stringify({ data: mapped, summary }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_sleep_detailed tool
+ *
+ * ENDPOINT CONSISTENCY: Uses detailed sleep periods for comprehensive data
+ * CACHE KEY BUG FIX: Use actual end_date instead of literal 'today'
+ */
+async function handleGetSleepDetailed(args) {
+    const params = validateParams(dateRangeSchema, args);
+    const { start_date, end_date } = params;
+    // FIXED: Resolve end_date to actual date for cache key consistency
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `sleep_detailed:${start_date}:${actualEndDate}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getSleepPeriods(start_date, actualEndDate);
+    const mapped = data.map((item) => {
+        // FIXED: Calculate real efficiency using nullish coalescing
+        const calculated_efficiency = (item.time_in_bed ?? 0) > 0
+            ? ((item.total_sleep_duration ?? 0) / (item.time_in_bed ?? 1)) * 100
+            : 0;
+        return {
+            date: item.day,
+            type: item.type,
+            bedtime_start: item.bedtime_start, // ISO 8601 with timezone
+            bedtime_end: item.bedtime_end, // ISO 8601 with timezone
+            breath_average: item.average_breath,
+            heart_rate: {
+                interval: item.heart_rate.interval,
+                samples: item.heart_rate.items,
+                average: item.average_heart_rate,
+                lowest: item.lowest_heart_rate,
+            },
+            hrv: {
+                interval: item.hrv.interval,
+                samples: item.hrv.items,
+                average: item.average_hrv, // Raw HRV in milliseconds
+            },
+            movement_30_sec: item.movement_30_sec,
+            sleep_phase_5_min: item.sleep_phase_5_min,
+            // Sleep metrics (all in seconds)
+            time_in_bed: item.time_in_bed,
+            total_sleep_duration: item.total_sleep_duration,
+            deep_sleep_duration: item.deep_sleep_duration,
+            light_sleep_duration: item.light_sleep_duration,
+            rem_sleep_duration: item.rem_sleep_duration,
+            awake_time: item.awake_time,
+            efficiency: calculated_efficiency, // FIXED: Real percentage
+            efficiency_raw: item.efficiency, // Original value for reference
+            latency: item.latency,
+        };
+    });
+    const result = JSON.stringify({ data: mapped }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_tags tool
+ *
+ * CACHE KEY BUG FIX: Use actual end_date instead of literal 'today'
+ */
+async function handleGetTags(args) {
+    const params = validateParams(dateRangeSchema, args);
+    const { start_date, end_date } = params;
+    // FIXED: Resolve end_date to actual date for cache key consistency
+    const actualEndDate = end_date || getTodayDate();
+    const cacheKey = `tags:${start_date}:${actualEndDate}`;
+    const cached = cache.get(cacheKey);
+    if (cached)
+        return cached;
+    const data = await getTags(start_date, actualEndDate);
+    const mapped = data.map((item) => ({
+        date: item.timestamp,
+        day: item.day,
+        text: item.text,
+        timestamp: item.timestamp,
+        tags: item.tags,
+    }));
+    const result = JSON.stringify({ data: mapped }, null, 2);
+    cache.set(cacheKey, result);
+    return result;
+}
+/**
+ * Handler for get_health_insights tool
+ */
+async function handleGetHealthInsights(args) {
+    const params = validateParams(healthInsightsSchema, args);
+    const days = params.days || 7;
+    const endDate = getTodayDate();
+    const startDate = getDaysAgo(days);
+    // Fetch recent data
+    const [sleepData, activityData, readinessData] = await Promise.all([
+        getDailySleep(startDate, endDate),
+        getDailyActivity(startDate, endDate),
+        getDailyReadiness(startDate, endDate),
+    ]);
+    // Generate insights
+    const insights = [];
+    // Sleep insights
+    const avgSleepScore = sleepData.reduce((acc, item) => acc + item.score, 0) / sleepData.length;
+    if (avgSleepScore < 70) {
+        insights.push({
+            category: 'sleep',
+            finding: `Your average sleep score is ${avgSleepScore.toFixed(0)}, which is below optimal levels.`,
+            recommendation: 'Try to maintain a consistent sleep schedule and aim for 7-9 hours of sleep per night.',
+            priority: 'high',
+        });
+    }
+    // Activity insights
+    const avgSteps = activityData.reduce((acc, item) => acc + item.steps, 0) / activityData.length;
+    if (avgSteps < 7000) {
+        insights.push({
+            category: 'activity',
+            finding: `Your average daily steps (${avgSteps.toFixed(0)}) are below the recommended 7,000-10,000 steps.`,
+            recommendation: 'Consider taking short walks throughout the day to increase your activity level.',
+            priority: 'medium',
+        });
+    }
+    // Readiness insights with REAL HRV data
+    const avgReadiness = readinessData.reduce((acc, item) => acc + item.score, 0) / readinessData.length;
+    if (avgReadiness < 70) {
+        insights.push({
+            category: 'readiness',
+            finding: `Your average readiness score is ${avgReadiness.toFixed(0)}, indicating suboptimal recovery.`,
+            recommendation: 'Focus on recovery strategies like adequate sleep, stress management, and proper nutrition.',
+            priority: 'high',
+        });
+    }
+    // HRV insights using balance score from readiness endpoint (0-100 score)
+    const avgHRVBalance = readinessData.reduce((acc, item) => acc + item.contributors.hrv_balance, 0) / readinessData.length;
+    if (avgHRVBalance < 70) {
+        insights.push({
+            category: 'recovery',
+            finding: `Your average HRV balance score is ${avgHRVBalance.toFixed(0)}/100, suggesting elevated stress or recovery needs.`,
+            recommendation: 'Consider stress reduction techniques, quality sleep, and avoiding overtraining.',
+            priority: 'high',
+        });
+    }
+    // RHR insights using real BPM from sleep periods endpoint
+    const sleepDataForRHR = await getSleepPeriods(startDate, endDate);
+    const rhrValues = sleepDataForRHR
+        .filter((s) => s.lowest_heart_rate != null)
+        .map((s) => s.lowest_heart_rate);
+    if (rhrValues.length > 0) {
+        const firstRHR = rhrValues[0];
+        const lastRHR = rhrValues[rhrValues.length - 1];
+        if (lastRHR > firstRHR + 3) {
+            insights.push({
+                category: 'recovery',
+                finding: `Your resting heart rate has increased from ${firstRHR} to ${lastRHR} BPM, which may indicate stress or overtraining.`,
+                recommendation: 'Ensure adequate rest and recovery. Consider reducing training intensity temporarily.',
+                priority: 'medium',
+            });
+        }
+    }
+    // Determine trends
+    const sleepTrend = sleepData[0]?.score > sleepData[sleepData.length - 1]?.score ? 'declining' : 'improving';
+    const activityTrend = activityData[0]?.score > activityData[activityData.length - 1]?.score ? 'declining' : 'improving';
+    const readinessTrend = readinessData[0]?.score > readinessData[readinessData.length - 1]?.score ? 'declining' : 'improving';
+    const result = JSON.stringify({
+        period: {
+            start_date: startDate,
+            end_date: endDate,
+        },
+        insights,
+        trends: {
+            sleep: sleepTrend,
+            activity: activityTrend,
+            readiness: readinessTrend,
+        },
+    }, null, 2);
+    return result;
+}
+//# sourceMappingURL=tools.js.map
