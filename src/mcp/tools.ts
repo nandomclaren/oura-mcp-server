@@ -540,12 +540,13 @@ async function handleGetSleepSummary(args: any): Promise<string> {
       
       return {
         ...baseData,
-        // Contributor scores (0-100)
-        hrv_balance: readiness?.contributors.hrv_balance ?? null,
-        // RAW VALUES - What users actually need!
+        // Contributor scores (0-100) - scores, not raw measurements
+        hrv_balance_score: readiness?.contributors.hrv_balance ?? null,
+        resting_heart_rate_score: readiness?.contributors.resting_heart_rate ?? null,
+        // Real measured values from detailed sleep endpoint
         hrv_average_ms: detailedSleep?.average_hrv ?? null,
         hrv_samples_count: detailedSleep?.hrv?.items?.length ?? 0,
-        resting_heart_rate_bpm: readiness?.contributors.resting_heart_rate ?? null,
+        resting_heart_rate_bpm: detailedSleep?.lowest_heart_rate ?? null,
         // DATA QUALITY: Indicate if HRV data was found
         has_readiness_data: readiness !== undefined,
       };
@@ -587,40 +588,61 @@ async function handleGetReadinessScore(args: any): Promise<string> {
   const params = validateParams<{ start_date: string; end_date?: string }>(dateRangeSchema, args);
   const { start_date, end_date } = params;
 
-  // FIXED: Resolve end_date to actual date for cache key consistency
   const actualEndDate = end_date || getTodayDate();
   const cacheKey = `readiness:${start_date}:${actualEndDate}`;
   const cached = cache.get<string>(cacheKey);
   if (cached) return cached;
 
-  const data = await getDailyReadiness(start_date, actualEndDate);
+  // Fetch readiness + detailed sleep in parallel to get real RHR (BPM) and HRV (ms)
+  // NOTE: contributors.resting_heart_rate and contributors.hrv_balance are SCORES (0-100),
+  // NOT real values. Real values come from the sleep periods endpoint.
+  const [data, sleepData] = await Promise.all([
+    getDailyReadiness(start_date, actualEndDate),
+    getSleepPeriods(start_date, actualEndDate),
+  ]);
 
-  const mapped = data.map((item) => ({
-    date: item.day,
-    score: item.score,
-    temperature_deviation: item.temperature_deviation,
-    temperature_trend_deviation: item.temperature_trend_deviation,
-    activity_balance: item.contributors.activity_balance,
-    body_temperature: item.contributors.body_temperature,
-    hrv_balance: item.contributors.hrv_balance, // HRV contributor score (0-100)
-    previous_day_activity: item.contributors.previous_day_activity,
-    previous_night: item.contributors.previous_night,
-    recovery_index: item.contributors.recovery_index,
-    resting_heart_rate: item.contributors.resting_heart_rate, // Raw RHR in BPM
-    sleep_balance: item.contributors.sleep_balance,
-  }));
+  const mapped = data.map((item) => {
+    const sleepForDay = sleepData.find((s) => s.day === item.day);
+
+    return {
+      date: item.day,
+      score: item.score,
+      temperature_deviation: item.temperature_deviation,
+      temperature_trend_deviation: item.temperature_trend_deviation,
+      // Contributor scores (0-100) - these are scores, not raw measurements
+      activity_balance_score: item.contributors.activity_balance,
+      body_temperature_score: item.contributors.body_temperature,
+      hrv_balance_score: item.contributors.hrv_balance,
+      previous_day_activity_score: item.contributors.previous_day_activity,
+      previous_night_score: item.contributors.previous_night,
+      recovery_index_score: item.contributors.recovery_index,
+      resting_heart_rate_score: item.contributors.resting_heart_rate,
+      sleep_balance_score: item.contributors.sleep_balance,
+      // Real measured values from sleep periods endpoint
+      resting_heart_rate_bpm: sleepForDay?.lowest_heart_rate ?? null,
+      hrv_average_ms: sleepForDay?.average_hrv ?? null,
+    };
+  });
 
   const avgScore = mapped.reduce((acc, item) => acc + item.score, 0) / mapped.length;
   const firstScore = mapped[0]?.score || 0;
   const lastScore = mapped[mapped.length - 1]?.score || 0;
   const trend = lastScore > firstScore + 5 ? 'improving' : lastScore < firstScore - 5 ? 'declining' : 'stable';
 
+  const validRHR = mapped.filter((item) => item.resting_heart_rate_bpm !== null);
+  const validHRV = mapped.filter((item) => item.hrv_average_ms !== null);
+
   const summary = {
     average_score: avgScore,
     trend,
     total_days: mapped.length,
-    average_resting_hr: mapped.reduce((acc, item) => acc + item.resting_heart_rate, 0) / mapped.length,
-    average_hrv_balance: mapped.reduce((acc, item) => acc + item.hrv_balance, 0) / mapped.length,
+    average_resting_hr_bpm: validRHR.length > 0
+      ? validRHR.reduce((acc, item) => acc + (item.resting_heart_rate_bpm || 0), 0) / validRHR.length
+      : null,
+    average_hrv_ms: validHRV.length > 0
+      ? validHRV.reduce((acc, item) => acc + (item.hrv_average_ms || 0), 0) / validHRV.length
+      : null,
+    average_hrv_balance_score: mapped.reduce((acc, item) => acc + item.hrv_balance_score, 0) / mapped.length,
   };
 
   const result = JSON.stringify({ data: mapped, summary }, null, 2);
@@ -954,29 +976,35 @@ async function handleGetHealthInsights(args: any): Promise<string> {
     });
   }
 
-  // HRV insights using REAL data from readiness endpoint
+  // HRV insights using balance score from readiness endpoint (0-100 score)
   const avgHRVBalance = readinessData.reduce((acc, item) => acc + item.contributors.hrv_balance, 0) / readinessData.length;
   if (avgHRVBalance < 70) {
     insights.push({
       category: 'recovery',
-      finding: `Your average HRV balance is ${avgHRVBalance.toFixed(0)}, suggesting elevated stress or recovery needs.`,
+      finding: `Your average HRV balance score is ${avgHRVBalance.toFixed(0)}/100, suggesting elevated stress or recovery needs.`,
       recommendation: 'Consider stress reduction techniques, quality sleep, and avoiding overtraining.',
       priority: 'high',
     });
   }
 
-  // RHR insights using REAL data from readiness endpoint
-  const avgRHR = readinessData.reduce((acc, item) => acc + item.contributors.resting_heart_rate, 0) / readinessData.length;
-  const firstRHR = readinessData[0]?.contributors.resting_heart_rate || avgRHR;
-  const lastRHR = readinessData[readinessData.length - 1]?.contributors.resting_heart_rate || avgRHR;
-  
-  if (lastRHR > firstRHR + 3) {
-    insights.push({
-      category: 'recovery',
-      finding: `Your resting heart rate has increased from ${firstRHR.toFixed(0)} to ${lastRHR.toFixed(0)} BPM, which may indicate stress or overtraining.`,
-      recommendation: 'Ensure adequate rest and recovery. Consider reducing training intensity temporarily.',
-      priority: 'medium',
-    });
+  // RHR insights using real BPM from sleep periods endpoint
+  const sleepDataForRHR = await getSleepPeriods(startDate, endDate);
+  const rhrValues = sleepDataForRHR
+    .filter((s) => s.lowest_heart_rate != null)
+    .map((s) => s.lowest_heart_rate);
+
+  if (rhrValues.length > 0) {
+    const firstRHR = rhrValues[0];
+    const lastRHR = rhrValues[rhrValues.length - 1];
+
+    if (lastRHR > firstRHR + 3) {
+      insights.push({
+        category: 'recovery',
+        finding: `Your resting heart rate has increased from ${firstRHR} to ${lastRHR} BPM, which may indicate stress or overtraining.`,
+        recommendation: 'Ensure adequate rest and recovery. Consider reducing training intensity temporarily.',
+        priority: 'medium',
+      });
+    }
   }
 
   // Determine trends
